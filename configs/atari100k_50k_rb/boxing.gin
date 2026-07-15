@@ -1,5 +1,0 @@
-include 'configs/atari100k_dreamer3/boxing.gin'
-
-MultiEnvReplayBuffer.capacity = 50000
-
-Trainer.eval_interval = 1000000

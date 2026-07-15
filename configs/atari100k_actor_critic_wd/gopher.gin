@@ -1,3 +1,0 @@
-include 'configs/atari100k_dreamer3/gopher.gin'
-
-Dreamer.ac_weight_decay = 1e-4

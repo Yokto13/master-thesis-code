@@ -1,5 +1,0 @@
-include 'configs/atari100k_dreamer3/jamesbond.gin'
-
-MultiEnvReplayBuffer.capacity = 25000
-
-Trainer.eval_interval = 1000000
