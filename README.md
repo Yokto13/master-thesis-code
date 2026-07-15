@@ -14,7 +14,7 @@ The models are relatively large; therefore, training them on a GPU is highly enc
 This repository uses `uv` for dependency management. Install it with:
 
 ```bash
-curl -LsSf [https://astral.sh/uv/install.sh](https://astral.sh/uv/install.sh) | sh
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ```
 
@@ -42,5 +42,5 @@ The repository contains two branches:
 I conducted these experiments over several months, during which the codebase was constantly changing.
 Consequently, it is difficult to guarantee that minor changes will not alter the results of older experiments.
 Instead of providing a single implementation that handles everything, I have provided snapshots of the `src` directory from the exact moments the experiments were conducted.
-These snapshots are in `experiments_snapshots` directory.
+These snapshots are in the `experiment_snapshots` directory.
 This should facilitate reproducibility.
