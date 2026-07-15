@@ -1,4 +1,4 @@
-include 'configs/atari400k_laprop_256_rms/amidar.gin'
+include 'configs/atari100k_dreaming_jepa_base/amidar.gin'
 
 Dreamer.sigreg_lambda = 0.05
 Dreamer.lejepa_weight = 2.0
