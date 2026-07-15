@@ -1,0 +1,84 @@
+[project]
+name = "master-thesis-code"
+version = "1.0.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11, <3.12"
+dependencies = [
+    "ale-py>=0.11.2",
+    "einops>=0.8.1",
+    "gin-config>=0.5.0",
+    "gymnasium[accept-rom-license,atari,box2d]>=1.2.2",
+    "ipython>=9.8.0",
+    "numpy>=2.3.5",
+    "opencv-python>=4.11.0.86",
+    "pillow>=12.0.0",
+    "pytest>=9.0.1",
+    "swig>=4.4.0",
+    "pandas>=2.0",
+    "wandb>=0.23.0",
+    "torchrl>=0.10.1",
+    "setuptools>=80.10.2",
+    "scipy>=1.17.1",
+    "rliable>=1.0.0",
+    "matplotlib>=3.7",
+    "arch<7",
+]
+
+[tool.ruff]
+line-length = 119
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+[project.optional-dependencies]
+rocm72 = [
+  "torch>=2.9.1",
+  "triton-rocm"
+]
+cu128 = [
+  "torch>=2.9.1",
+]
+cpu = [
+  "torch>=2.9.1",
+]
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "rocm72" },
+    { extra = "cu128" },
+    { extra = "cpu" },
+  ],
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-rocm72", extra = "rocm72" },
+  { index = "pytorch-cu128", extra = "cu128" },
+  { index = "pytorch-cpu", extra = "cpu" },
+]
+triton-rocm = [
+  { index = "pytorch-rocm72", extra = "rocm72" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-rocm72"
+url = "https://download.pytorch.org/whl/rocm7.2"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
