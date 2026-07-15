@@ -28,10 +28,10 @@ Dreamer.norm = "rmsnorm"
 Dreamer.rb_loss_scale = 0.3
 Dreamer.repval_grad = True
 
-MultiEnvReplayBuffer.capacity = 1000000
-MultiEnvReplayBuffer.C = %C
-MultiEnvReplayBuffer.W = %W
-MultiEnvReplayBuffer.H = %H
+SingleEnvOnlineReplayBuffer.capacity = 1000000
+SingleEnvOnlineReplayBuffer.C = %C
+SingleEnvOnlineReplayBuffer.W = %W
+SingleEnvOnlineReplayBuffer.H = %H
 
 # Environment
 make_env.env_id = "ALE/UpNDown-v5"

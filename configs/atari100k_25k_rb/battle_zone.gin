@@ -1,0 +1,5 @@
+include 'configs/atari100k_dreamer3/battle_zone.gin'
+
+MultiEnvReplayBuffer.capacity = 25000
+
+Trainer.eval_interval = 1000000

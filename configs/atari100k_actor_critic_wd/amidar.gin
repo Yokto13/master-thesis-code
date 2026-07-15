@@ -1,0 +1,3 @@
+include 'configs/atari100k_dreamer3/amidar.gin'
+
+Dreamer.ac_weight_decay = 1e-4
