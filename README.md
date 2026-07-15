@@ -36,7 +36,7 @@ Unless you plan to run large training sessions, it is best to disable logging by
 
 The repository contains two branches:
 
-* `main`: Contains the reimplementation of the Dreamer 3 algorithm and supports running some of the experiments from the thesis.
+* `main`: Contains the reimplementation of the Dreamer 3 algorithm and supports running the weight decay and replay buffer experiments.
 * `reconstruction-free`: Provides the implementation of the reconstruction-free agent.
 
 I conducted these experiments over several months, during which the codebase was constantly changing.
