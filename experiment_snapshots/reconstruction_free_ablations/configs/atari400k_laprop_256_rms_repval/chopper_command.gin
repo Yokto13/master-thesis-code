@@ -1,0 +1,71 @@
+# Hyperparameters
+C = 3
+W = 64
+H = 64
+latent_dim = 1024
+unimix_ratio = 0.01
+target_critic = False
+critic_type = "TWO_HOT"
+
+# Class Configuration
+Encoder.C = %C
+Encoder.W = %W
+Encoder.H = %H
+
+Decoder.C = %C
+Decoder.W = %W
+Decoder.H = %H
+
+
+Dreamer.lr = 4e-5
+Dreamer.ac_loss_type = "ac"
+Dreamer.entropy_regularization = 0.0003
+Dreamer.returns_type = "gae"
+Dreamer.unimix_ratio = %unimix_ratio
+Dreamer.use_target_network = %target_critic
+Dreamer.critic_type = %critic_type
+Dreamer.norm = "rmsnorm"
+Dreamer.rb_loss_scale = 0.3
+Dreamer.repval_grad = True
+
+MultiEnvReplayBuffer.capacity = 1000000
+MultiEnvReplayBuffer.C = %C
+MultiEnvReplayBuffer.W = %W
+MultiEnvReplayBuffer.H = %H
+
+# Environment
+make_env.env_id = "ALE/ChopperCommand-v5"
+make_env.wrapper_type = "pong"
+make_env.frame_skip = 4
+make_env.repeat_action_probability = 0.0
+make_env.noop_max = 30
+make_env.resize_engine = "pillow"
+
+# Trainer
+Trainer.total_env_steps = 100000
+Trainer.batch_size = 16
+Trainer.seq_len = 64
+Trainer.eval_interval = 10000
+Trainer.warmup_steps = 0
+Trainer.log_interval = 2400
+Trainer.train_every = 4
+Trainer.eval_episodes = 10
+Trainer.save_each = 50000
+Trainer.latent_dim = %latent_dim
+Trainer.burn_in_steps = 1
+Trainer.thorough_eval = True
+
+# Initialization outscale parameters
+Encoder.outscale = 1.0
+Decoder.outscale = 1.0
+RSSM.outscale = 1.0
+Dreamer.reward_head_outscale = 0.0
+Dreamer.cont_head_outscale = 1.0
+Dreamer.actor_outscale = 0.01
+Dreamer.critic_outscale = 0.0
+Dreamer.eps = 1e-20
+Dreamer.optimizer = "laprop"
+
+MLP.norm="rmsnorm"
+Encoder.norm="rms"
+Decoder.norm="rms"

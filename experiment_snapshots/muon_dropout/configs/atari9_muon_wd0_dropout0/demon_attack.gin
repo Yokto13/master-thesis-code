@@ -1,0 +1,8 @@
+include 'configs/atari9/demon_attack.gin'
+
+Dreamer.optimizer = "muon"
+Dreamer.muon_lr = 2e-3
+Dreamer.muon_ac = False
+Dreamer.muon_weight_decay = 0.0
+RSSM.prior_dropout = 0.0
+RSSM.posterior_dropout = 0.0

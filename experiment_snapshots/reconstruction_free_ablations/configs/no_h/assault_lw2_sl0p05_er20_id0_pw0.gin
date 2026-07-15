@@ -1,0 +1,10 @@
+include 'configs/atari400k_laprop_256_rms/assault.gin'
+
+Dreamer.sigreg_lambda = 0.05
+Dreamer.lejepa_weight = 2.0
+Dreamer.inv_dyn_weight = 0.0
+Dreamer.emb_recon_weight = 20.0
+
+Dreamer.debug_decoders = False
+
+Dreamer.pred_weight = 0.0

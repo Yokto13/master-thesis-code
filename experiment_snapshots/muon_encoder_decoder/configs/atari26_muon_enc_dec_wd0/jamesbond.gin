@@ -1,0 +1,8 @@
+include 'configs/atari400k_laprop_256_rms_repval/jamesbond.gin'
+
+Trainer.save_each = 1000000
+
+Dreamer.optimizer = "muon_enc_dec"
+Dreamer.muon_lr = 2e-3
+Dreamer.muon_ac = False
+Dreamer.muon_weight_decay = 0.0
