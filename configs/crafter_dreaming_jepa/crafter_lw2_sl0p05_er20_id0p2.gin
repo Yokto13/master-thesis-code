@@ -1,0 +1,7 @@
+include 'configs/crafter_dreamer3/crafter.gin'
+
+Dreamer.sigreg_lambda = 0.05
+Dreamer.lejepa_weight = 2.0
+Dreamer.inv_dyn_weight = 0.2
+Dreamer.emb_recon_weight = 20.0
+Dreamer.debug_decoders = False
