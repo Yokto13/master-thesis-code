@@ -1,13 +1,16 @@
 import logging
 
 import gin
-import torch
 import torch.nn as nn
 from einops import rearrange
-from modules import MLP, RMSNormChannels
+from modules import RMSNormChannels
 from utils import trunc_normal_init
 
 logger = logging.getLogger(__name__)
+
+
+def _input_transform(x):
+    return x.float() / 255.0 - 0.5
 
 
 class Conv2dMaxPoolBlock(nn.Module):
@@ -89,23 +92,24 @@ class EncoderBlock(nn.Module):
 
 @gin.configurable
 class Encoder(nn.Module):
-    def __init__(self, C, W, H, fan: str = "in", outscale: float = 1.0, norm: str = "rms", stride=1):
+    def __init__(self, C, W, H, fan: str = "in", outscale: float = 1.0, norm: str = "rms", stride=1, depth=64):
         super().__init__()
 
         # Original JAX depths based on depth=64 * mults(2,3,4,4)
         K = 5
-        depth = 64
         mults = [2, 3, 4, 4]
         depths = [depth * m for m in mults]
         # TODO: We should check how Dreamer pads...
         padding = (K - 1) // 2  # To maintain spatial dimensions before pooling
 
-        self.blocks = nn.ModuleList(
-            [
-                EncoderBlock(
+        import torch.nn as nn
+
+        self.blocks = nn.ModuleDict(
+            {
+                "stage_1": EncoderBlock(
                     C, depths[0], kernel_size=K, fan=fan, stride=stride, padding=padding, outscale=outscale, norm=norm
                 ),
-                EncoderBlock(
+                "stage_2": EncoderBlock(
                     depths[0],
                     depths[1],
                     kernel_size=K,
@@ -115,7 +119,7 @@ class Encoder(nn.Module):
                     outscale=outscale,
                     norm=norm,
                 ),
-                EncoderBlock(
+                "stage_3": EncoderBlock(
                     depths[1],
                     depths[2],
                     kernel_size=K,
@@ -125,7 +129,7 @@ class Encoder(nn.Module):
                     outscale=outscale,
                     norm=norm,
                 ),
-                EncoderBlock(
+                "stage_4": EncoderBlock(
                     depths[2],
                     depths[3],
                     kernel_size=K,
@@ -135,37 +139,40 @@ class Encoder(nn.Module):
                     outscale=outscale,
                     norm=norm,
                 ),
-            ]
+            }
         )
 
-        self.blocks = self.blocks.to(memory_format=torch.channels_last)
+        # self.blocks = self.blocks.to(memory_format=torch.channels_last)
 
         self.flatten = nn.Flatten()
 
         # Expose output size so downstream modules (RSSM) can use it
         final_w = W // 16
         final_h = H // 16
-        self.output_dim = depths[-1] * final_w * final_h
+        self.output_dim = 1024
 
-        self.final_projection = MLP(self.output_dim, self.output_dim)
+        self.final_projector = nn.Sequential(
+            nn.Linear(depths[-1] * final_w * final_h, 1024),
+            nn.BatchNorm1d(1024, eps=1e-4),
+            nn.SiLU(),
+            nn.Linear(1024, self.output_dim),
+        )
 
     def forward(self, x):
-        x = x.float()
-        # x shape: (B, T, C, H, W) -> Note: PyTorch usually does H, W
-        x = x / 255.0 - 0.5  # Original used -0.5 centering
+        x = _input_transform(x)
 
         # Merge Batch and Time
         B, T, C, H, W = x.shape
         x = rearrange(x, "b t c h w -> (b t) c h w")
 
-        x = x.to(memory_format=torch.channels_last)
+        # x = x.to(memory_format=torch.channels_last)
 
-        for block in self.blocks:
+        for block in self.blocks.values():
             x = block(x)
 
         x = self.flatten(x)
 
-        # x = self.final_projection(x)
+        x = self.final_projector(x)
 
         # Restore (B, T, D)
         return rearrange(x, "(b t) d -> b t d", b=B)

@@ -3,6 +3,7 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from ale_py import ALEState
 from gymnasium import Wrapper
 
@@ -76,3 +77,33 @@ def get_post_burn_in(burn_in_steps: int, x: torch.Tensor, axis: int = 1) -> torc
     slices = [slice(None)] * x.dim()
     slices[axis] = slice(burn_in_steps, None)
     return x[tuple(slices)]
+
+
+def random_shift(x: torch.Tensor, pad: int) -> torch.Tensor:
+    """DrQ-style random-shift augmentation with edge (replicate) padding.
+
+    Pads the image by ``pad`` pixels on every side and crops back a random window
+    of the original size. A single shift is drawn per sequence and shared across
+    time and channels, so the temporal dynamics are preserved -- drawing an
+    independent shift per frame would inject unpredictable motion that the
+    forward-prediction (``pred``) loss cannot model.
+
+    Args:
+        x: image tensor of shape (B, T, C, H, W); cast to float internally.
+        pad: padding/shift magnitude in pixels (e.g. 4).
+
+    Returns:
+        Float tensor of shape (B, T, C, H, W), same value range as the input.
+    """
+    b, t, c, h, w = x.shape
+    x = x.float()
+    padded = F.pad(x.reshape(b * t, c, h, w), (pad, pad, pad, pad), mode="replicate")
+    padded = padded.reshape(b, t, c, h + 2 * pad, w + 2 * pad)
+
+    out = torch.empty_like(x)
+    for i in range(b):
+        # CPU-sampled python ints (seeded by the global RNG) -> no device sync.
+        oh = int(torch.randint(0, 2 * pad + 1, (1,)).item())
+        ow = int(torch.randint(0, 2 * pad + 1, (1,)).item())
+        out[i] = padded[i, :, :, oh : oh + h, ow : ow + w]
+    return out

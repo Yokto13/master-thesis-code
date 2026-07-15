@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import random
@@ -8,7 +9,6 @@ import gin
 import numpy as np
 import torch
 import torch.nn as nn
-from debug_mode import DebugMode
 from dreamer import Dreamer
 from einops import rearrange
 from envs import make_env
@@ -43,7 +43,6 @@ class Trainer:
         train_every: int = 1,
         eval_episodes: int = 10,
         save_each: int = 50000,
-        debug_mode: str = "OFF",
         seed: int = 42,
         burn_in_steps: int = 0,
         thorough_eval: bool = False,
@@ -71,7 +70,6 @@ class Trainer:
         self.save_dir = log_dir
         self.warmup_steps = warmup_steps
         self.log_interval = log_interval
-        self.debug_mode = DebugMode[debug_mode]
         self.burn_in_steps = burn_in_steps
         self.seed = seed
         self.run_name = run_name
@@ -118,13 +116,15 @@ class Trainer:
         self._recent_episode_lengths = deque(maxlen=self.return_smooth_window)
         self._last_log_step = 0
 
+        # Crafter achievement tracking (populated only when the env reports achievements)
+        self._crafter_episodes = 0
+        self._crafter_unlocks = {}  # achievement name -> episodes in which it was unlocked
+        prefix = f"dreamer_{self.run_name}" if self.run_name else "dreamer"
+        self._crafter_stats_path = os.path.join(self.save_dir, f"{prefix}_s{self.seed}_stats.jsonl")
+
         if self.supervised:
             assert self._load_buffer, "Supervised mode requires --load_buffer to be specified."
-            logger.warning(
-                "Running in supervised mode based on loaded buffer. "
-                "The agent still interacts with the environment but never train on these interactions."
-                "The interactions are here just to monitor agent's performance in the environment. "
-            )
+            logger.warning("Running in supervised mode based on loaded buffer. ")
             # Disable pushing new transitions to buffer in supervised mode
             self.buffer.push = lambda *args, **kwargs: None
 
@@ -156,10 +156,15 @@ class Trainer:
         while global_step < self.total_env_steps:
             # Sampling actions uniformly as warmup is not needed as the policy is itself nearly uniform at the start.
             prev_rssm_state = rssm_state
-            action, rssm_state = self._get_action(obs, rssm_state, prev_action, in_eval=False)
-
-            next_obs, reward, terminated, truncated, info = self.env.step(action)
-            done = terminated or truncated
+            if self.supervised:
+                action = 0
+                next_obs, reward, done = obs, 0.0, False
+            else:
+                self.dreamer.wm_to_eval()
+                action, rssm_state = self._get_action(obs, rssm_state, prev_action, in_eval=False)
+                self.dreamer.wm_to_train()
+                next_obs, reward, terminated, truncated, info = self.env.step(action)
+                done = terminated or truncated
             current_episode_return += reward
             current_episode_length += 1
 
@@ -192,6 +197,8 @@ class Trainer:
                 )
 
                 self._log_train_episode(current_episode_return, current_episode_length, global_step)
+                if "achievements" in info:
+                    self._record_crafter_episode(current_episode_return, current_episode_length, info["achievements"])
                 current_episode_return = 0.0
                 current_episode_length = 0
                 next_obs, _ = self.env.reset()
@@ -293,10 +300,18 @@ class Trainer:
                             self._train_episode_lengths.clear()
                         if self._recent_episode_lengths:
                             log_data["train/episode_length_smooth"] = np.mean(self._recent_episode_lengths)
+                        if self._crafter_episodes:
+                            log_data["crafter/score"] = self._crafter_score()
+                            log_data["crafter/episodes"] = self._crafter_episodes
+                            for name, unlocks in self._crafter_unlocks.items():
+                                log_data[f"crafter/achievement/{name}"] = unlocks / self._crafter_episodes
                         metric_key_map = {
                             "wm/loss": "wm_loss",
                             "wm/kl_loss": "kl",
-                            "wm/recon_loss": "recon",
+                            "wm/pred_loss": "pred_loss",
+                            "wm/sigreg_loss": "sigreg_loss",
+                            "wm/embed_std": "embed_std",
+                            "wm/embed_mean_abs": "embed_mean_abs",
                             "wm/reward_loss": "reward_loss",
                             "wm/discount_loss": "discount_loss",
                             "ac/actor_loss": "actor",
@@ -321,8 +336,14 @@ class Trainer:
                             "ac/critic_grad_norm": "critic_grad_norm",
                             "wm/prior_entropy": "wm/prior_entropy",
                             "wm/posterior_entropy": "wm/posterior_entropy",
+                            "wm/emb_recon_loss": "emb_recon_loss",
+                            "wm/inv_dyn_loss": "inv_dyn_loss",
+                            "wm/inv_dyn_acc": "inv_dyn_acc",
+                            "wm/inv_dyn_probe_loss": "inv_dyn_probe_loss",
+                            "wm/inv_dyn_probe_acc": "inv_dyn_probe_acc",
+                            "wm/recon_loss": "recon",
+                            "wm/embed_probe_recon_loss": "embed_probe_recon",
                         }
-
                         for log_key, metric_key in metric_key_map.items():
                             if metric_key not in metrics:
                                 continue
@@ -341,21 +362,27 @@ class Trainer:
                                 "replay_buffer/size": len(self.buffer),
                             }
                         )
-                        if train_step_counter % (self.log_interval * 10) == 0:
-                            # Logging too often does not provide additional benefit and
-                            # just wastes some disk space somewhere.
+                        # Logging too often does not provide additional benefit and
+                        # just wastes some disk space somewhere.
 
-                            # Extract one frame for visualization (Batch 0, Time 0)
-                            # States are (B, T, C, W, H) with values 0-255
-                            vis_frame = batch["states"][0, 0].cpu().numpy().astype(np.uint8)
-                            vis_frame = np.transpose(vis_frame, (1, 2, 0))
+                        # Extract one frame for visualization (Batch 0, Time 0)
+                        # States are (B, T, C, W, H) with values 0-255
+                        vis_frame = batch["states"][0, 0].cpu().numpy().astype(np.uint8)
+                        vis_frame = np.transpose(vis_frame, (1, 2, 0))
 
-                            log_data["train/observation"] = wandb.Image(vis_frame)
+                        log_data["train/observation"] = wandb.Image(vis_frame)
 
-                            if "reconstruction_example" in metrics:
-                                recon_example = (metrics["reconstruction_example"].float().cpu().numpy()) * 255.0
-                                recon_example = np.transpose(recon_example, (1, 2, 0)).astype(np.uint8)
-                                log_data["train/reconstruction"] = wandb.Image(recon_example)
+                        if "reconstruction_example" in metrics:
+                            recon_example = (metrics["reconstruction_example"].float().cpu().numpy()) * 255.0
+                            recon_example = np.transpose(recon_example, (1, 2, 0)).astype(np.uint8)
+                            log_data["train/reconstruction"] = wandb.Image(recon_example)
+
+                        if "embed_probe_reconstruction_example" in metrics:
+                            probe_example = (
+                                metrics["embed_probe_reconstruction_example"].float().cpu().numpy()
+                            ) * 255.0
+                            probe_example = np.transpose(probe_example, (1, 2, 0)).astype(np.uint8)
+                            log_data["train/embed_probe_reconstruction"] = wandb.Image(probe_example)
                         wandb.log(log_data, step=global_step)
 
             if self._should_evaluate(global_step):
@@ -366,17 +393,22 @@ class Trainer:
                 eval_env.close()
                 self._log_eval_results(avg_return, std, global_step)
 
+        log_data = {}
         if self._train_episode_returns:
-            log_data = {"train/episode_return": np.mean(self._train_episode_returns)}
+            log_data["train/episode_return"] = np.mean(self._train_episode_returns)
             if self._recent_episode_returns:
                 log_data["train/episode_return_smooth"] = np.mean(self._recent_episode_returns)
             if self._train_episode_lengths:
                 log_data["train/episode_length"] = np.mean(self._train_episode_lengths)
             if self._recent_episode_lengths:
                 log_data["train/episode_length_smooth"] = np.mean(self._recent_episode_lengths)
-            wandb.log(log_data, step=global_step)
             self._train_episode_returns.clear()
             self._train_episode_lengths.clear()
+        if self._crafter_episodes:
+            log_data["crafter/score"] = self._crafter_score()
+            log_data["crafter/episodes"] = self._crafter_episodes
+        if log_data:
+            wandb.log(log_data, step=global_step)
 
         self.save_checkpoint("final")
         if self._save_obs:
@@ -404,6 +436,25 @@ class Trainer:
         self._recent_episode_returns.append(episode_return)
         self._recent_episode_lengths.append(episode_length)
 
+    def _record_crafter_episode(self, episode_return, episode_length, achievements):
+        """Track achievement unlocks and append one episode to the official-format stats.jsonl."""
+        self._crafter_episodes += 1
+        for name, count in achievements.items():
+            self._crafter_unlocks[name] = self._crafter_unlocks.get(name, 0) + (1 if count > 0 else 0)
+        stats = {
+            "episode": self._crafter_episodes,
+            "length": episode_length,
+            "reward": round(episode_return, 1),
+            **{f"achievement_{k}": v for k, v in achievements.items()},
+        }
+        with open(self._crafter_stats_path, "a") as f:
+            f.write(json.dumps(stats) + "\n")
+
+    def _crafter_score(self):
+        """Crafter score: geometric mean of achievement success rates (in percent) over training episodes."""
+        rates = [100.0 * unlocks / self._crafter_episodes for unlocks in self._crafter_unlocks.values()]
+        return float(np.exp(np.mean(np.log1p(rates))) - 1.0)
+
     def _log_eval_results(self, avg_return, std, global_step):
         logger.info("[Evaluation] Average Return: %.2f | Std: %.2f", avg_return, std)
         wandb.log({"eval/avg_return": avg_return, "eval/std_return": std}, step=global_step)
@@ -421,6 +472,8 @@ class Trainer:
             action: Scalar action index (int)
             new_rssm_state: Updated RSSM state dict
         """
+        mode = self.dreamer.training
+        self.dreamer.eval()  # Ensure we're in eval mode for action selection
         with torch.inference_mode():
             # Add batch and time dims: (C,H,W) -> (1,1,C,H,W)
             obs_tensor = torch.from_numpy(obs).unsqueeze(0).unsqueeze(0).to(self.device)
@@ -456,6 +509,7 @@ class Trainer:
 
             new_rssm_state = {"deter": step_out["deter_state"], "stoch": stoch_state}
 
+        self.dreamer.train(mode)  # Restore the original training mode
         return action_idx.item(), new_rssm_state
 
     def evaluate(self, env, num_episodes=1, render=False):

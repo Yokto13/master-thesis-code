@@ -39,19 +39,20 @@ class MLP(nn.Module):
     """
     Unified MLP backbone for feed-forward networks.
 
-    Structure: (Linear → Norm (optional) → Activation) × num_layers
+    Structure: (Linear → Norm (optional) → Activation → Dropout (optional)) × num_layers
 
-    Output dimension equals hidden_dim. Use a separate Linear head
-    to project to the final required dimension.
+    Output dimension is output_dim if provided, otherwise hidden_dim.
     """
 
     def __init__(
         self,
         input_dim: int,
         hidden_dim: int,
+        output_dim: int = None,
         num_layers: int = 1,
         activation: str = "silu",
         norm: str = "layernorm",
+        dropout: float = 0.0,
         fan: str = "in",
         outscale: float = 1.0,
         blocks: int = 1,
@@ -60,27 +61,33 @@ class MLP(nn.Module):
 
         assert num_layers >= 1, "MLP requires at least 1 layer"
         assert norm in ("none", "layernorm", "rmsnorm")
+        assert 0.0 <= dropout < 1.0, "dropout must be in [0.0, 1.0)"
 
         activation_fn = {"silu": nn.SiLU, "gelu": nn.GELU}[activation]
         norm_fn = {
             "none": lambda dim: nn.Identity(),
             "layernorm": lambda dim: nn.LayerNorm(dim, eps=1e-4),
             "rmsnorm": lambda dim: nn.RMSNorm(dim, eps=1e-4),
+            "batchnorm": lambda dim: nn.BatchNorm1d(dim),
         }[norm]
 
         layers = []
         in_dim = input_dim
-        for _ in range(num_layers):
+        for i in range(num_layers):
+            layer_out_dim = (
+                hidden_dim if i < num_layers - 1 else (output_dim if output_dim is not None else hidden_dim)
+            )
             if blocks > 1:
-                layers.append(BlockLinear(in_dim, hidden_dim, blocks, fan=fan, outscale=outscale))
+                layers.append(BlockLinear(in_dim, layer_out_dim, blocks, fan=fan, outscale=outscale))
             else:
-                layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(norm_fn(hidden_dim))
+                layers.append(nn.Linear(in_dim, layer_out_dim))
+            layers.append(norm_fn(layer_out_dim))
             layers.append(activation_fn())
+            layers.append(nn.Dropout(p=dropout))
             in_dim = hidden_dim
 
         self.net = nn.Sequential(*layers)
-        self.output_dim = hidden_dim
+        self.output_dim = output_dim if output_dim is not None else hidden_dim
 
         # Apply trunc_normal_init to all Linear layers
         self._init_weights(fan, outscale)
@@ -159,9 +166,12 @@ class TwoHotHead(DenseHead):
         An implementation trick from the DreamerV3 codebase.
 
         Creates symmetric buckets around **zero**:
-        - For odd number of buckets: includes exact zero bucket
+        - For odd number of buckets: includes a single exact zero bucket
             - For odd numbers (255) it is probably unecessary
-        - For even number of buckets: symmetric around zero without zero bucket
+        - For even number of buckets: NOTE the current construction duplicates the
+          zero (produces both 0.0 and -0.0) because linspace(-20, 0, n//2) includes
+          the 0 endpoint and the full half is then mirrored. The default buckets_n=255
+          is odd, so this even branch is currently unused.
 
         Args:
             buckets_n: Number of buckets to create

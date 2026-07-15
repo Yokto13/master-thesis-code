@@ -23,6 +23,7 @@ dependencies = [
     "rliable>=1.0.0",
     "matplotlib>=3.7",
     "arch<7",
+    "crafter>=1.8.3",
 ]
 
 [tool.ruff]

@@ -13,11 +13,12 @@ from optim.agc import clip_grad_agc_
 from optim.laprop import LaProp
 from rssm import RSSM
 from scalar_head_type import ScalarHeadType
+from sigreg import EppsPulley, SlicingUnivariateTest
 from torch.amp import GradScaler, autocast
 from torch.distributions import Categorical
 from torch.optim.lr_scheduler import LambdaLR
 from torchrl.modules import OneHotCategorical
-from utils import dict_apply, get_post_burn_in, unimix
+from utils import dict_apply, get_post_burn_in, random_shift, trunc_normal_init, unimix
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +56,23 @@ class Dreamer(nn.Module):
         use_amp: bool = True,
         repval_grad: bool = False,
         horizon: int = 15,
-        ac_weight_decay: float = 0.0,
+        sigreg_lambda: float = 0.05,
+        sigreg_num_slices: int = 1024,
+        sigreg_t_max: float = 3.0,
+        sigreg_n_points: int = 17,
+        lejepa_weight: float = 1.0,
+        pred_weight: float = 1.0,
+        emb_recon_weight: float = 0.0,
+        inv_dyn_weight: float = 0.0,
+        aug_random_shift: bool = False,
+        aug_shift_pad: int = 4,
+        aug_two_view: bool = False,
+        debug_decoders: bool = False,
     ) -> None:
         super().__init__()
 
         # Validate optimizer choice
-        allowed_optimizers = ["adam", "muon", "laprop"]
+        allowed_optimizers = ["adam", "laprop"]
         if optimizer.lower() not in allowed_optimizers:
             raise ValueError(f"optimizer must be one of {allowed_optimizers}, got '{optimizer}'")
         self.optimizer_name = optimizer.lower()
@@ -70,8 +82,8 @@ class Dreamer(nn.Module):
             "lr=%s eps=%s ac_loss_type=%s "
             "entropy_regularization=%s returns_type=%s num_categories=%s "
             "unimix_ratio=%s critic_type=%s critic_ema_decay=%s use_target_network=%s "
-            "rb_loss_scale=%s slowreg=%s optimizer=%s"
-            "repval_grad=%s horizon=%s",
+            "rb_loss_scale=%s slowreg=%s optimizer=%s "
+            "repval_grad=%s horizon=%s lejepa_weight=%s pred_weight=%s emb_recon_weight=%s inv_dyn_weight=%s",
             stoch_dim,
             deter_dim,
             latent_dim,
@@ -91,6 +103,10 @@ class Dreamer(nn.Module):
             optimizer,
             repval_grad,
             horizon,
+            lejepa_weight,
+            pred_weight,
+            emb_recon_weight,
+            inv_dyn_weight,
         )
         self.horizon = horizon
         self.repval_grad = repval_grad
@@ -112,8 +128,20 @@ class Dreamer(nn.Module):
 
         self.encoder = Encoder()
         encoder_output_dim = self.encoder.output_dim
-        self.encoder = torch.compile(self.encoder)
-        self.decoder = Decoder(stoch_dim=self.stoch_dim, deter_dim=deter_dim, hidden_dim=latent_dim)
+
+        # self.encoder = torch.compile(self.encoder)
+        # Debug-only pixel decoders for wandb visualization (trained on detached
+        # features). Disable via `debug_decoders=False` to save GPU memory.
+        # self.decoder reconstructs from [z, h]; self.embed_probe from the detached
+        # encoder embedding alone, separating "encoder never captured it" from
+        # "posterior dropped it".
+        self.debug_decoders = debug_decoders
+        if self.debug_decoders:
+            self.decoder = Decoder(stoch_dim=self.stoch_dim, deter_dim=deter_dim, hidden_dim=latent_dim)
+            self.embed_probe = Decoder(stoch_dim=encoder_output_dim, deter_dim=None, hidden_dim=latent_dim)
+        else:
+            self.decoder = None
+            self.embed_probe = None
         # RSSM should also take norm
         self.rssm = RSSM(
             deter_dim=deter_dim,
@@ -123,6 +151,85 @@ class Dreamer(nn.Module):
             num_categories=num_categories,
             unimix_ratio=unimix_ratio,
             action_dim=self.action_dim,
+        )
+
+        # JEPA-style predictor: maps RSSM deterministic state to encoder embedding
+        # space. Replaces the image-reconstruction head as the grounding signal
+        # for the encoder. SIGReg (below) prevents the trivial collapse where
+        # encoder + predictor settle on a constant output.
+        self.emb_predictor = nn.Sequential(
+            nn.Linear(deter_dim, 2048),
+            nn.BatchNorm1d(2048, eps=1e-4),
+            nn.SiLU(),
+            nn.Linear(2048, 1024),
+        )
+
+        # JEPA-style embedding decoder: reconstructs embed_t from the posterior
+        # feature [deter, posterior_stoch]. Closed-loop counterpart to emb_predictor
+        # (which predicts embed_t from the prior) and the embedding-space analog of
+        # the deleted pixel decoder — it forces the posterior latent the policy
+        # consumes to actually encode the current observation. Gated by emb_recon_weight.
+        self.emb_decoder = nn.Sequential(
+            nn.Linear(deter_dim + self.stoch_dim, 2048),
+            nn.BatchNorm1d(2048, eps=1e-4),
+            nn.SiLU(),
+            nn.Linear(2048, encoder_output_dim),
+        )
+
+        # Inverse-dynamics head: predicts action_t from (embed_{t-1}, embed_t).
+        # Operates on raw encoder embeddings (not detached) so its gradient trains
+        # the encoder to retain controllable content — the content-grounding signal
+        # SIGReg lacks. Independent of emb_predictor (forward dynamics) and
+        # emb_decoder (posterior reconstruction). Gated by inv_dyn_weight.
+        # Uses RMSNorm (Dreamer house style); BN's anti-collapse role doesn't apply
+        # to a discriminative CE classifier.
+        self.inv_dyn = nn.Sequential(
+            nn.Linear(2 * encoder_output_dim, 2048),
+            nn.RMSNorm(2048, eps=1e-4),
+            nn.SiLU(),
+            nn.Linear(2048, self.action_dim),
+        )
+
+        # Debug-only inverse-dynamics probe: same architecture as inv_dyn but reads
+        # *detached* embeddings, so it measures action-decodability from the encoder
+        # without shaping it. The inv_dyn-on vs inv_dyn-off contrast in its accuracy
+        # tells whether the real inv_dyn term actually *adds* controllable content
+        # the encoder wouldn't otherwise carry. Gated by debug_decoders.
+        self.inv_dyn_probe = (
+            nn.Sequential(
+                nn.Linear(2 * encoder_output_dim, 2048),
+                nn.RMSNorm(2048, eps=1e-4),
+                nn.SiLU(),
+                nn.Linear(2048, self.action_dim),
+            )
+            if self.debug_decoders
+            else None
+        )
+
+        # init
+        probe_init = [self.inv_dyn_probe] if self.debug_decoders else []
+        for m in [self.emb_predictor, self.emb_decoder, self.inv_dyn, *probe_init]:
+            for layer in m:
+                if isinstance(layer, nn.Linear):
+                    trunc_normal_init(layer.weight, fan="in", scale=1)
+                    nn.init.zeros_(layer.bias)
+
+        self.embed_dim = encoder_output_dim
+        self.sigreg_lambda = sigreg_lambda
+        self.lejepa_weight = lejepa_weight
+        self.pred_weight = pred_weight
+        self.emb_recon_weight = emb_recon_weight
+        self.inv_dyn_weight = inv_dyn_weight
+        self.aug_random_shift = aug_random_shift
+        self.aug_shift_pad = aug_shift_pad
+        self.aug_two_view = aug_two_view
+        logger.debug(
+            "aug_random_shift=%s aug_shift_pad=%s aug_two_view=%s", aug_random_shift, aug_shift_pad, aug_two_view
+        )
+        self.sigreg = SlicingUnivariateTest(
+            univariate_test=EppsPulley(t_max=sigreg_t_max, n_points=sigreg_n_points),
+            num_slices=sigreg_num_slices,
+            reduction="mean",
         )
 
         input_dim_ac = self.stoch_dim + deter_dim
@@ -166,21 +273,31 @@ class Dreamer(nn.Module):
             input_dim=input_dim_ac, output_dim=1, num_hidden_layers=1, outscale=cont_head_outscale, norm=norm
         )
 
-        wm_params = list(
-            chain(
-                self.encoder.parameters(),
+        wm_param_iters = [self.encoder.parameters()]
+        if self.debug_decoders:
+            # Debug-only decoders, trained on detached features (see wm_forward_step).
+            wm_param_iters += [
                 self.decoder.parameters(),
-                self.rssm.parameters(),
-                self.rewards.parameters(),
-                self.discounts.parameters(),
-            )
-        )
-        ac_params = list(chain(self.actor.parameters(), self.critic.parameters()))
-        param_groups = [
-            {"params": wm_params, "weight_decay": 0.0},
-            {"params": ac_params, "weight_decay": ac_weight_decay},
+                self.embed_probe.parameters(),
+                self.inv_dyn_probe.parameters(),
+            ]
+        wm_param_iters += [
+            self.emb_predictor.parameters(),
+            self.emb_decoder.parameters(),
+            self.inv_dyn.parameters(),
+            self.rssm.parameters(),
+            self.rewards.parameters(),
+            self.discounts.parameters(),
         ]
-        self.optimizer = self._create_optimizer(param_groups, lr=lr, eps=eps)
+        self.optimizer = self._create_optimizer(
+            chain(*wm_param_iters),
+            chain(
+                self.actor.parameters(),
+                self.critic.parameters(),
+            ),
+            lr=lr,
+            eps=eps,
+        )
 
         # Linear warmup schedulers
         def _warmup_lr(step: int) -> float:
@@ -230,8 +347,14 @@ class Dreamer(nn.Module):
             "rewards": self.rewards,
             "discounts": self.discounts,
             "encoder": self.encoder,
-            "decoder": self.decoder,
+            "emb_predictor": self.emb_predictor,
+            "emb_decoder": self.emb_decoder,
+            "inv_dyn": self.inv_dyn,
         }
+        if self.debug_decoders:
+            modules["decoder"] = self.decoder
+            modules["embed_probe"] = self.embed_probe
+            modules["inv_dyn_probe"] = self.inv_dyn_probe
         total = 0
         for key, module in modules.items():
             n = sum(p.numel() for p in module.parameters())
@@ -244,12 +367,11 @@ class Dreamer(nn.Module):
         self.target_critic.train(False)
         return self
 
-    def _create_optimizer(self, params, lr: float, eps: float):
+    def _create_optimizer(self, wm_params, ac_params, lr: float, eps: float):
         """Create optimizer based on self.optimizer_name."""
+        params = chain(wm_params, ac_params)
         if self.optimizer_name == "adam":
             return torch.optim.Adam(params, lr=lr, fused=True, eps=eps)
-        elif self.optimizer_name == "muon":
-            return torch.optim.Muon(params, lr=lr, eps=eps)
         elif self.optimizer_name == "laprop":
             return LaProp(params, lr=lr, eps=eps)
         else:
@@ -262,17 +384,42 @@ class Dreamer(nn.Module):
         previous_states = batch.get("rnn_states", None)
         # previous_states = None
 
-        embeds = self.encoder(states)
+        # DrQ-style random-shift augmentation (training only). One shift per
+        # sequence keeps the dynamics consistent. `states` stays clean (used by the
+        # two-view target and the debug decoder); `states_online` drives the
+        # encoder/RSSM and carries the SIGReg gradient.
+        aug_on = self.aug_random_shift and self.training
+        states_online = random_shift(states, self.aug_shift_pad) if aug_on else states
+
+        embeds = self.encoder(states_online)
         rssm_out = self.rssm(actions, embeds, is_first, state=previous_states)
 
-        latent = rssm_out["posterior"]["sample"]
-        deter_state = rssm_out["deter_state"]
+        # Debug-only decoder: inputs are detached so gradients never flow back
+        # into the RSSM/encoder. The decoder is trained on these detached features
+        # purely to visualize what the reconstruction-free latents encode.
+        reconstructions = None
+        if self.debug_decoders:
+            latent = rssm_out["posterior"]["sample"]
+            deter_state = rssm_out["deter_state"]
+            reconstructions = self.decoder(latent.detach(), deter_state.detach())
 
-        reconstructions = self.decoder(latent, deter_state)
+        # Two-view target: predict the CLEAN embedding from the augmented-input
+        # state, so the shift trains encoder invariance without injecting positional
+        # noise into the predicted dynamics (the pred/emb_recon targets stay clean).
+        # The target is stop-gradiented downstream, so the extra encode is no_grad.
+        # When two-view is off, the target is just the (online) embeds -> single view.
+        if aug_on and self.aug_two_view:
+            with torch.no_grad():
+                target_embeds = self.encoder(states)
+        else:
+            target_embeds = embeds
 
-        return reconstructions, rssm_out
+        return reconstructions, rssm_out, embeds, target_embeds
 
-    def train_step(self, batch, burn_in_steps: int, train_only_wm: bool = False) -> tuple[dict, dict]:
+    def train_step(
+        self, batch, burn_in_steps: int, train_only_wm: bool = False, train: bool = True
+    ) -> tuple[dict, dict]:
+        self.train()
         wm_losses, rssm_out, wm_metrics = self.wm_forward_step(batch, burn_in_steps)
 
         rssm_out = dict_apply(lambda x: get_post_burn_in(burn_in_steps, x), rssm_out)
@@ -282,22 +429,58 @@ class Dreamer(nn.Module):
         if train_only_wm:
             ac_losses, ac_metrics = {}, {}
         else:
+            # Dreams are essentially inference
+            # we should be carefull to turn of Dropout and related things in the WM
+            self.wm_to_eval()
             ac_losses, ac_metrics = self.ac_forward_step(rssm_out, rewards, dones)
+            self.wm_to_train()
 
         losses = {**wm_losses, **ac_losses}
 
-        backward_metrics = self._backward(losses)
+        backward_metrics = self._backward(losses, train)
 
         if not train_only_wm:
-            self.update_target_network()
+            self._update_target_network()
 
         return rssm_out, {**wm_metrics, **ac_metrics, **backward_metrics, **losses}
 
-    def _backward(self, losses: dict):
+    def wm_to_eval(self):
+        self.encoder.eval()
+        if self.debug_decoders:
+            self.decoder.eval()
+        self.rssm.eval()
+
+    def wm_to_train(self):
+        self.encoder.train()
+        if self.debug_decoders:
+            self.decoder.train()
+        self.rssm.train()
+
+    def _backward(self, losses: dict, train: bool = True):
         metrics = {}
 
-        pred_loss = losses["recon"] + losses["reward"] + losses["discount"]
-        wm_loss = pred_loss * self.beta_pred + losses["kl"]
+        # PoC: "recon" loss replaced by JEPA-style "pred" + SIGReg.
+        # LeJEPA convention: λ·sigreg + (1-λ)·pred_per_dim, single trade-off param.
+        # pred_loss_term = losses["recon"] + losses["reward"] + losses["discount"]
+        # LEJEPA lambda * sigreg + (1 - lambda) * MSE
+        # LEWM (lambda * sigreg + MSE) * beta_sigreg <--- we use this
+        jepa_loss = self.sigreg_lambda * losses["sigreg"] + self.pred_weight * losses["pred"]
+        pred_loss_term = self.lejepa_weight * jepa_loss + losses["reward"] + losses["discount"]
+        if "emb_recon" in losses:
+            pred_loss_term = pred_loss_term + self.emb_recon_weight * losses["emb_recon"]
+        if "inv_dyn" in losses:
+            pred_loss_term = pred_loss_term + self.inv_dyn_weight * losses["inv_dyn"]
+        wm_loss = pred_loss_term * self.beta_pred + losses["kl"]
+        if "recon" in losses:
+            # Decoder inputs are detached, so this term only updates the debug
+            # decoder; its weighting is irrelevant to the rest of the model.
+            wm_loss = wm_loss + losses["recon"]
+        if "embed_probe_recon" in losses:
+            # Same: detached input, only updates the debug embed probe.
+            wm_loss = wm_loss + losses["embed_probe_recon"]
+        if "inv_dyn_probe" in losses:
+            # Same: detached input, only updates the debug inverse-dynamics probe.
+            wm_loss = wm_loss + losses["inv_dyn_probe"]
         metrics["wm_loss"] = wm_loss
 
         train_only_wm = "actor" not in losses
@@ -306,8 +489,21 @@ class Dreamer(nn.Module):
         else:
             ac_loss = losses["actor"] + losses["critic"]
             total_loss = wm_loss + ac_loss
+        if not train:
+            return metrics
 
-        trained_modules = [self.encoder, self.decoder, self.rssm, self.rewards, self.discounts]
+        trained_modules = [
+            self.encoder,
+            self.emb_predictor,
+            self.emb_decoder,
+            self.inv_dyn,
+            self.rssm,
+            self.rewards,
+            self.discounts,
+        ]
+        if self.debug_decoders:
+            # Debug-only decoders, trained on detached features (see wm_forward_step).
+            trained_modules += [self.decoder, self.embed_probe, self.inv_dyn_probe]
         if not train_only_wm:
             trained_modules += [self.actor, self.critic]
 
@@ -335,8 +531,7 @@ class Dreamer(nn.Module):
     def wm_forward_step(self, batch, burn_in_steps: int) -> torch.Tensor:
         loss, metrics = {}, {}
         with autocast(device_type=self.amp_device, dtype=self.amp_dtype, enabled=self.use_amp):
-            reconstructions, rssm_out = self(batch)
-            states = batch["states"]
+            reconstructions, rssm_out, embeds, target_embeds = self(batch)
             rewards = batch["rewards"]
             dones = batch["dones"]
 
@@ -344,9 +539,131 @@ class Dreamer(nn.Module):
             dones = get_post_burn_in(burn_in_steps, dones)
             is_first = get_post_burn_in(burn_in_steps, batch["is_first"])
 
-            loss["recon"] = self.decoder.reconstruction_loss(
-                get_post_burn_in(burn_in_steps, reconstructions), get_post_burn_in(burn_in_steps, states)
+            # --- JEPA-style predictor loss (replaces image reconstruction) ---
+            # deter_t is computed from (prev_stoch, action_t, prev_deter) BEFORE
+            # the posterior sees embed_t (see RSSM.wake_step). The codebase
+            # invariant features[t] <-> s_t makes embed_t = encoder(s_t) the
+            # correct prediction target for deter_t.
+            # Target is stop-gradiented: the world model (predictor/deter) should
+            # adapt to the encoder, not the other way around. The encoder is shaped
+            # independently by SIGReg, inv_dyn, and reward — not by the quality of
+            # a learned model that is itself still training.
+            deter_post = get_post_burn_in(burn_in_steps, rssm_out["deter_state"])
+            embeds_post = get_post_burn_in(burn_in_steps, embeds)
+            # pred/emb_recon target. With two-view aug this is the CLEAN embedding
+            # (the encoder is shaped on the augmented `embeds_post` via SIGReg/RSSM;
+            # the targets stay clean). Without two-view it equals embeds_post.
+            target_post = get_post_burn_in(burn_in_steps, target_embeds)
+            is_first_post = get_post_burn_in(burn_in_steps, batch["is_first"])
+            b = embeds_post.size(0)
+            pred_embed = rearrange(
+                self.emb_predictor(rearrange(deter_post, "b t d -> (b t) d")), "(b t) d -> b t d", b=b
             )
+            # At is_first positions, prev_deter/prev_stoch and the (arrival-aligned)
+            # action are all zeroed, so deter_t is a constant. The pred loss there
+            # is irreducible — mask those positions out so the only signal in
+            # loss["pred"] comes from steps the predictor can actually learn.
+            per_pos_pred = ((pred_embed - target_post.detach()) ** 2).mean(dim=-1)
+            valid_mask = 1.0 - is_first_post.float()
+            loss["pred"] = (per_pos_pred * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+
+            # --- Embedding decoder loss (closed-loop, posterior side) ---
+            # Reconstruct embed_t from the policy feature [deter, posterior_stoch].
+            # Target is detached: SIGReg pins embed to unit-variance/full-rank, so it
+            # can't collapse, and the gradient trains the posterior + decoder (not the
+            # encoder target). Unlike pred, no is_first mask: the posterior saw embed_t
+            # even at episode starts, so that step is reconstructable.
+            if self.emb_recon_weight > 0:
+                post_stoch_sample = get_post_burn_in(burn_in_steps, rssm_out["posterior"]["sample"])
+                recon_input = torch.cat([deter_post, post_stoch_sample], dim=-1)
+                emb_recon = rearrange(
+                    self.emb_decoder(rearrange(recon_input, "b t d -> (b t) d")), "(b t) d -> b t d", b=b
+                )
+                loss["emb_recon"] = ((emb_recon - target_post.detach()) ** 2).mean()
+
+            # --- Inverse-dynamics loss (encoder content grounding) ---
+            # Predict action_t from (embed_{t-1}, embed_t). action[:, t] is the
+            # arrival-aligned action driving the s_{t-1} -> s_t transition (see
+            # RSSM.forward), so it pairs with embeds[:, t-1] and embeds[:, t].
+            # Embeds are NOT detached: the gradient trains the encoder to retain
+            # controllable content. Masking is on the destination index (1:): a
+            # transition crosses an episode boundary iff its second frame is a
+            # reset (is_first), which is also where the dummy/zeroed action sits.
+            if self.inv_dyn_weight > 0:
+                actions_post = get_post_burn_in(burn_in_steps, batch["actions"])
+                inv_input = torch.cat([embeds_post[:, :-1], embeds_post[:, 1:]], dim=-1)
+                inv_logits = rearrange(self.inv_dyn(rearrange(inv_input, "b t d -> (b t) d")), "(b t) d -> b t d", b=b)
+                inv_targets = actions_post[:, 1:].argmax(dim=-1)
+                inv_valid = 1.0 - is_first_post[:, 1:].float()
+                inv_ce = nn.functional.cross_entropy(
+                    rearrange(inv_logits.float(), "b t d -> (b t) d"),
+                    rearrange(inv_targets, "b t -> (b t)"),
+                    reduction="none",
+                )
+                inv_ce = rearrange(inv_ce, "(b t) -> b t", b=b)
+                loss["inv_dyn"] = (inv_ce * inv_valid).sum() / inv_valid.sum().clamp(min=1)
+                with torch.no_grad():
+                    inv_correct = (inv_logits.argmax(dim=-1) == inv_targets).float()
+                    inv_dyn_acc = (inv_correct * inv_valid).sum() / inv_valid.sum().clamp(min=1)
+
+            embed_probe_recons = None
+            if self.debug_decoders:
+                # --- Debug-only reconstruction loss (detached inputs => trains only the decoder) ---
+                loss["recon"] = self.decoder.reconstruction_loss(
+                    get_post_burn_in(burn_in_steps, reconstructions),
+                    get_post_burn_in(burn_in_steps, batch["states"]),
+                )
+
+                # --- Debug-only embed probe (detached embeds => trains only the probe) ---
+                # Probes the online encoder output directly, bypassing the RSSM.
+                embed_probe_recons = self.embed_probe(embeds.detach())
+                loss["embed_probe_recon"] = self.embed_probe.reconstruction_loss(
+                    get_post_burn_in(burn_in_steps, embed_probe_recons),
+                    get_post_burn_in(burn_in_steps, batch["states"]),
+                )
+
+                # --- Debug-only inverse-dynamics probe (detached embeds => trains only the probe) ---
+                # Mirrors the inv_dyn head on stop-grad'd embeds, so it measures how
+                # decodable action_t is from (embed_{t-1}, embed_t) *without* shaping
+                # the encoder. Compare inv_dyn_probe_acc at inv_dyn_weight 0 vs 0.05:
+                # equal => the term adds no controllable content (redundant).
+                inv_probe_actions = get_post_burn_in(burn_in_steps, batch["actions"])
+                inv_probe_input = torch.cat([embeds_post[:, :-1], embeds_post[:, 1:]], dim=-1).detach()
+                inv_probe_logits = rearrange(
+                    self.inv_dyn_probe(rearrange(inv_probe_input, "b t d -> (b t) d")), "(b t) d -> b t d", b=b
+                )
+                inv_probe_targets = inv_probe_actions[:, 1:].argmax(dim=-1)
+                inv_probe_valid = 1.0 - is_first_post[:, 1:].float()
+                inv_probe_ce = nn.functional.cross_entropy(
+                    rearrange(inv_probe_logits.float(), "b t d -> (b t) d"),
+                    rearrange(inv_probe_targets, "b t -> (b t)"),
+                    reduction="none",
+                )
+                inv_probe_ce = rearrange(inv_probe_ce, "(b t) -> b t", b=b)
+                loss["inv_dyn_probe"] = (inv_probe_ce * inv_probe_valid).sum() / inv_probe_valid.sum().clamp(min=1)
+                with torch.no_grad():
+                    inv_probe_correct = (inv_probe_logits.argmax(dim=-1) == inv_probe_targets).float()
+                    inv_dyn_probe_acc = (inv_probe_correct * inv_probe_valid).sum() / inv_probe_valid.sum().clamp(
+                        min=1
+                    )
+
+        # SIGReg in fp32: Epps-Pulley uses cos/sin/exp over CF points and is
+        # numerically sensitive. Flatten (B, T, D) -> (B*T, D) so each sample
+        # is one embedding vector.
+        embeds_flat = rearrange(embeds_post, "b t d -> (b t) d").float()
+        loss["sigreg"] = self.sigreg(embeds_flat)
+        metrics["embed_std"] = embeds_flat.std()
+        metrics["embed_mean_abs"] = embeds_flat.abs().mean()
+        metrics["pred_loss"] = loss["pred"].detach()
+        metrics["sigreg_loss"] = loss["sigreg"].detach()
+        if "emb_recon" in loss:
+            metrics["emb_recon_loss"] = loss["emb_recon"].detach()
+        if "inv_dyn" in loss:
+            metrics["inv_dyn_loss"] = loss["inv_dyn"].detach()
+            metrics["inv_dyn_acc"] = inv_dyn_acc
+        if "inv_dyn_probe" in loss:
+            metrics["inv_dyn_probe_loss"] = loss["inv_dyn_probe"].detach()
+            metrics["inv_dyn_probe_acc"] = inv_dyn_probe_acc
 
         posterior_max_logit = torch.tensor(0.0)
         prior_max_logit = torch.tensor(0.0)
@@ -473,9 +790,11 @@ class Dreamer(nn.Module):
                 "discount_loss": discount_loss,
                 "posterior_max_logit": posterior_max_logit,
                 "prior_max_logit": prior_max_logit,
-                "reconstruction_example": reconstructions[0, 0].detach().clone(),
             }
         )
+        if self.debug_decoders:
+            metrics["reconstruction_example"] = reconstructions[0, 0].detach().clone()
+            metrics["embed_probe_reconstruction_example"] = embed_probe_recons[0, 0].detach().clone()
 
         return loss, rssm_out, metrics
 
@@ -692,7 +1011,7 @@ class Dreamer(nn.Module):
 
         return loss, metrics
 
-    def update_target_network(self):
+    def _update_target_network(self):
         with torch.inference_mode():
             for param, target_param in zip(self.critic.parameters(), self.target_critic.parameters()):
                 target_param.data.lerp_(param.data, 1 - self.critic_ema_decay)

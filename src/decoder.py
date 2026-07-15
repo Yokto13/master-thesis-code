@@ -13,7 +13,14 @@ logger = logging.getLogger(__name__)
 
 class DecoderBlock(nn.Module):
     def __init__(
-        self, in_channels, out_channels, fan: str = "in", outscale: float = 1.0, activation="silu", norm: str = "rms"
+        self,
+        in_channels,
+        out_channels,
+        fan: str = "in",
+        outscale: float = 1.0,
+        activation="silu",
+        norm: str = "rms",
+        dropout: float = 0.0,
     ):
         super().__init__()
         # JAX equivalent: Upsample -> Conv5x5 -> Norm -> Act
@@ -37,6 +44,7 @@ class DecoderBlock(nn.Module):
                     raise ValueError(f"Unknown norm: {norm}")
             if bias:
                 nn.init.zeros_(self.conv.bias)
+        self.dropout = nn.Dropout2d(dropout) if dropout > 0.0 else None
 
         # Apply trunc_normal_init to Conv2d layer
         trunc_normal_init(self.conv.weight, fan=fan, scale=outscale)
@@ -50,6 +58,7 @@ class DecoderBlock(nn.Module):
         if self.activation_type is not None:
             x = self.norm(x)
             x = self.act(x)
+            x = self.dropout(x) if self.dropout is not None else x
         return x
 
 
@@ -61,12 +70,13 @@ class Decoder(nn.Module):
         W,
         H,
         stoch_dim: int,
-        deter_dim: int,
+        deter_dim: int | None,
         hidden_dim: int,
         fan: str = "in",
         outscale: float = 1.0,
         norm: str = "rms",
         blocks: int = 8,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -80,7 +90,12 @@ class Decoder(nn.Module):
 
         flattend_size = depths[-1] * self.minres[0] * self.minres[1]
         self.bspace = blocks
-        self.deter_projection = BlockLinear(deter_dim, flattend_size, blocks=blocks, fan=fan, outscale=outscale)
+        # deter_dim=None builds a stoch-only decoder (used as a probe on raw encoder embeddings).
+        self.deter_projection = (
+            BlockLinear(deter_dim, flattend_size, blocks=blocks, fan=fan, outscale=outscale)
+            if deter_dim is not None
+            else None
+        )
         self.stoch_projection = nn.Sequential(
             # Give it more capacity with expansion pattern as stoch is typically small
             nn.Linear(stoch_dim, 2 * hidden_dim),
@@ -101,15 +116,21 @@ class Decoder(nn.Module):
         self.spatial_act = nn.SiLU()
 
         # 2. Main Upsampling Stack
-        self.blocks = nn.ModuleList(
-            [
-                DecoderBlock(depths[-1], depths[-2], fan=fan, outscale=outscale, norm=norm),
-                DecoderBlock(depths[-2], depths[-3], fan=fan, outscale=outscale, norm=norm),
-                DecoderBlock(depths[-3], depths[-4], fan=fan, outscale=outscale, norm=norm),
-                DecoderBlock(depths[-4], C, fan=fan, outscale=outscale, activation=None, norm=norm),
-            ]
+        self.blocks = nn.ModuleDict(
+            {
+                "stage_1": DecoderBlock(
+                    depths[-1], depths[-2], fan=fan, outscale=outscale, norm=norm, dropout=dropout
+                ),
+                "stage_2": DecoderBlock(
+                    depths[-2], depths[-3], fan=fan, outscale=outscale, norm=norm, dropout=dropout
+                ),
+                "stage_3": DecoderBlock(
+                    depths[-3], depths[-4], fan=fan, outscale=outscale, norm=norm, dropout=dropout
+                ),
+                "out": DecoderBlock(depths[-4], C, fan=fan, outscale=outscale, activation=None, norm=norm),
+            }
         )
-        self.blocks = self.blocks.to(memory_format=torch.channels_last)
+        # self.blocks = self.blocks.to(memory_format=torch.channels_last)
         self._init_weights(fan, outscale)
 
     def _init_weights(self, fan, outscale):
@@ -120,21 +141,23 @@ class Decoder(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, stoch: torch.Tensor, deter: torch.Tensor) -> torch.Tensor:
+    def forward(self, stoch: torch.Tensor, deter: torch.Tensor | None = None) -> torch.Tensor:
         B, T = stoch.shape[0], stoch.shape[1]
         stoch = rearrange(stoch, "B T D -> (B T) D")
-        deter = rearrange(deter, "B T D -> (B T) D")
 
-        x0 = self.deter_projection(deter)
         x1 = self.stoch_projection(stoch)
-        x0 = rearrange(x0, "BT (g H W c) -> BT (g c) H W", g=self.bspace, H=self.minres[0], W=self.minres[1])
-        x1 = rearrange(x1, "BT (C H W) -> BT C H W", H=self.minres[0], W=self.minres[1])
-        x = x0 + x1
+        x = rearrange(x1, "BT (C H W) -> BT C H W", H=self.minres[0], W=self.minres[1])
+        if deter is not None:
+            assert self.deter_projection is not None, "Decoder was built without a deter pathway"
+            deter = rearrange(deter, "B T D -> (B T) D")
+            x0 = self.deter_projection(deter)
+            x0 = rearrange(x0, "BT (g H W c) -> BT (g c) H W", g=self.bspace, H=self.minres[0], W=self.minres[1])
+            x = x + x0
         x = self.spatial_norm(x)
         x = self.spatial_act(x)
-        x = x.to(memory_format=torch.channels_last)
+        # x = x.to(memory_format=torch.channels_last)
 
-        for b in self.blocks:
+        for b in self.blocks.values():
             x = b(x)
 
         x = torch.sigmoid(x)

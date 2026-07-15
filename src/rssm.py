@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from typing import Any, Dict
 
 import gin
@@ -24,6 +25,8 @@ class RSSM(nn.Module):
         fan: str = "in",
         outscale: float = 1.0,
         n_of_blocks: int = 8,
+        prior_dropout: float = 0.0,
+        posterior_dropout: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -51,13 +54,43 @@ class RSSM(nn.Module):
         # Layer norm is essential for categorical RSSM
         # Without it, the logits go haywire and softmax saturates
         self.prior_net = nn.Sequential(
-            MLP(deter_dim, hidden_dim, num_layers=2, fan=fan, outscale=outscale, norm=norm),
-            nn.Linear(hidden_dim, stoch_dim),
+            OrderedDict(
+                [
+                    (
+                        "features",
+                        MLP(
+                            deter_dim,
+                            hidden_dim,
+                            num_layers=2,
+                            fan=fan,
+                            outscale=outscale,
+                            norm=norm,
+                            dropout=prior_dropout,
+                        ),
+                    ),
+                    ("out", nn.Linear(hidden_dim, stoch_dim)),
+                ]
+            )
         )
 
         self.posterior_net = nn.Sequential(
-            MLP(deter_dim + embed_dim, hidden_dim, num_layers=1, fan=fan, outscale=outscale, norm=norm),
-            nn.Linear(hidden_dim, stoch_dim),
+            OrderedDict(
+                [
+                    (
+                        "features",
+                        MLP(
+                            deter_dim + embed_dim,
+                            hidden_dim,
+                            num_layers=1,
+                            fan=fan,
+                            outscale=outscale,
+                            norm=norm,
+                            dropout=posterior_dropout,
+                        ),
+                    ),
+                    ("out", nn.Linear(hidden_dim, stoch_dim)),
+                ]
+            )
         )
 
         # Apply trunc_normal_init to all layers

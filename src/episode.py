@@ -1,7 +1,6 @@
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import numpy as np
-from git import Optional
 
 
 class Episode(NamedTuple):
