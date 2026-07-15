@@ -2,7 +2,7 @@
 C = 3
 W = 64
 H = 64
-latent_dim = 64
+latent_dim = 256
 unimix_ratio = 0.01
 target_critic = False
 critic_type = "TWO_HOT"
@@ -16,7 +16,7 @@ Decoder.C = %C
 Decoder.W = %W
 Decoder.H = %H
 
-Dreamer.lr = 1e-3
+Dreamer.lr = 3e-4
 Dreamer.ac_loss_type = "ac"
 Dreamer.entropy_regularization = 0.0003
 Dreamer.returns_type = "gae"
@@ -40,13 +40,13 @@ make_env.resize_engine = "pillow"
 
 # Trainer
 Trainer.total_env_steps = 100000
-Trainer.batch_size = 4
-Trainer.seq_len = 32
-Trainer.eval_interval = 10000
+Trainer.batch_size = 16
+Trainer.seq_len = 64
+Trainer.eval_interval = 5000
 Trainer.warmup_steps = 0
-Trainer.log_interval = 100
+Trainer.log_interval = 500
 Trainer.train_every = 4
-Trainer.eval_episodes = 3
+Trainer.eval_episodes = 4
 Trainer.save_each = 50000
 Trainer.latent_dim = %latent_dim
 Trainer.burn_in_steps = 1

@@ -147,7 +147,7 @@ class Encoder(nn.Module):
         final_h = H // 16
         self.output_dim = depths[-1] * final_w * final_h
 
-        self.final_projection = MLP(self.output_dim, self.output_dim)
+        # self.final_projection = MLP(self.output_dim, self.output_dim)
 
     def forward(self, x):
         x = x.float()

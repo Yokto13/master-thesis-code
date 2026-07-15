@@ -18,10 +18,12 @@ class DreamerCarRacingWrapper(gymnasium.Wrapper):
         super().__init__(env)
         self.actions = {
             0: np.array([0.0, 0.0, 0.0]),
-            1: np.array([-1.0, 0.0, 0.0]),
-            2: np.array([1.0, 0.0, 0.0]),
+            1: np.array([-0.9, 0.0, 0.0]),
+            2: np.array([0.9, 0.0, 0.0]),
             3: np.array([0.0, 1.0, 0.0]),
             4: np.array([0.0, 0.0, 0.8]),
+            5: np.array([0.0, 0.5, 0.0]),
+            6: np.array([0.0, 0.8, 0.0]),
         }
         self.action_space = gymnasium.spaces.Discrete(5)
 
@@ -99,9 +101,6 @@ class FrameSkip(gymnasium.Wrapper):
     def __init__(self, env, skip=4):
         super().__init__(env)
         self._skip = skip
-        logger.warning(
-            "FrameSkipping implementations often max pool last two frames. This implementation does not do that!"
-        )
 
     def step(self, action):
         total_reward = 0.0
