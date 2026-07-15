@@ -1,7 +1,7 @@
 [project]
 name = "master-thesis-code"
 version = "1.0.0"
-description = "Add your description here"
+description = "Source codes for master's thesis: Architectures for World Models in Reinforcement Learning"
 readme = "README.md"
 requires-python = ">=3.11, <3.12"
 dependencies = [
