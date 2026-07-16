@@ -27,6 +27,8 @@ WANDB_MODE="disabled" uv run train_dreamer.py --config configs/carracing.gin
 
 This will start training on the CarRacing environment. It takes approximately 5,000 to 10,000 steps before the agent learns to drive successfully.
 
+For a simple reconstruction-free run, I recommend training Pong from configs/atari100k_dreaming_jepa on the reconstruction-free branch. The full training takes several hours on a GPU, but the agent improves relatively quickly; hence, some improvements should be visible after a few dozen minutes.
+
 **Note on Wandb**
 
 By default, all experiments log to Wandb.
