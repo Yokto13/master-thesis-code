@@ -39,35 +39,35 @@ Unless you plan to run large training sessions, it is best to disable logging by
 | Game | Dreamer 3 | MuDreamer | Our Reimpl. of Dreamer 3 | Dreaming JEPA |
 | :--- | ---: | ---: | ---: | ---: |
 | Alien | 1278 | 951 | 923 | **1453** |
-| Amidar | 120 | 153 | 199 | 216 |
-| Assault | 741 | 891 | 741 | 629 |
-| Asterix | 1020 | 1411 | 962 | 955 |
+| Amidar | 120 | 153 | 199 | **216** |
+| Assault | 741 | **891** | 741 | 629 |
+| Asterix | 1020 | **1411** | 962 | 955 |
 | Bank Heist | 422 | 156 | 364 | **1069** |
-| Battle Zone | 20800 | 12080 | 15120 | 13240 |
+| Battle Zone | **20800** | 12080 | 15120 | 13240 |
 | Boxing | 87 | 96 | **98** | 76 |
-| Breakout | 11 | 34 | 15 | 91 |
-| Chopper Command | 2440 | 808 | 1714 | 1552 |
+| Breakout | 11 | 34 | 15 | **91** |
+| Chopper Command | **2440** | 808 | 1714 | 1552 |
 | Crazy Climber | 80060 | **96128** | 81462 | 73776 |
-| Demon Attack | 454 | 553 | 189 | 302 |
-| Freeway | 0 | 5 | 4 | 0 |
+| Demon Attack | 454 | **553** | 189 | 302 |
+| Freeway | 0 | **5** | 4 | 0 |
 | Frostbite | **3914** | 1652 | 2222 | 1754 |
 | Gopher | **2252** | 1500 | 2073 | 1444 |
 | Hero | **13324** | 8272 | 9963 | 12094 |
-| Jamesbond | 490 | 409 | 205 | 208 |
+| Jamesbond | **490** | 409 | 205 | 208 |
 | Kangaroo | 2840 | 4380 | 6504 | **7748** |
 | Krull | 8604 | 9644 | **10313** | 9088 |
 | Kung Fu Master | 25560 | **26832** | 22792 | 23422 |
 | Ms Pacman | 1400 | 2311 | 1837 | **2976** |
 | Pong | -5 | 18 | 14 | **21** |
 | Private Eye | **3238** | 1042 | 1815 | 139 |
-| Qbert | 3700 | 4061 | 4321 | 2489 |
-| Road Runner | 18440 | 8460 | 12690 | 11688 |
-| Seaquest | 964 | 428 | 842 | 966 |
+| Qbert | 3700 | 4061 | **4321** | 2489 |
+| Road Runner | **18440** | 8460 | 12690 | 11688 |
+| Seaquest | 964 | 428 | 842 | **966** |
 | Up N Down | 49456 | 26494 | 30498 | **68669** |
-| HNS mean | 128 | 126 | 128 | 143 |
-| HNS med | 49 | 34 | 47 | 48 |
-| HNS IQM | 52 | n/a | 50 | 48 |
-| Better than human | 7/26 | 11/26 | 7/26 | 10/26 |
+| HNS mean | 128 | 126 | 128 | **143** |
+| HNS med | **49** | 34 | 47 | 48 |
+| HNS IQM | **52** | n/a | 50 | 48 |
+| Better than human | 7/26 | **11/26** | 7/26 | 10/26 |
 
 *The results of Dreaming JEPA in comparison with the public Dreamer 3 implementation, MuDreamer (different reconstruction-free approach), and our reimplementation.*
 
