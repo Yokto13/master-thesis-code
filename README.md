@@ -21,7 +21,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Now, run:
 
 ```bash
-WANDB_MODE="disabled" uv run --extra cu128 train_dreamer.py --config configs/carracing.gin
+WANDB_MODE="disabled" uv run train_dreamer.py --config configs/carracing.gin
 
 ```
 
